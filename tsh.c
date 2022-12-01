@@ -45,7 +45,7 @@
 extern char **environ;      /* defined in libc */
 char prompt[] = "tsh> ";    /* command line prompt (DO NOT CHANGE) */
 int verbose = 0;            /* if true, print additional output */
-int nextjid = 1;            /* next job ID to allocate */
+int nextjid = 0;            /* next job ID to allocate */
 char sbuf[MAXLINE];         /* for composing sprintf messages */
 char * username;            /* The name of the user currently logged into the shell */
 struct job_t {              /* The job struct */
@@ -101,6 +101,7 @@ void deleteentry(pid_t pid);
 void update(pid_t pid, int old, int new);
 void logout(struct job_t *jobs);
 void history();
+int rerun_N(char *command);
 void update_shell_status(int state);
 int countlines();
 int remove_directory(const char *path);
@@ -157,7 +158,7 @@ int main(int argc, char **argv)
     int index = 0;
     /* Execute the shell's read/eval loop */
     addentry("shell", getpid(), SsF);
-    addjob(jobs, getpid(), BG, "shell");
+    addjob(jobs, getpid(), BG, "shell\n");
     while (1) {
 
         /* Read command line */
@@ -273,7 +274,7 @@ void adduser(char **argv) {
     if (stat(new_directory, &st) == -1) { /* If user not exists, create*/
         mkdir(new_directory, 0700);
     } else {    /*if user already existed*/
-        printf("user already existed!\n");
+        printf("User already exists!\n");
         return;
     }
     
@@ -310,6 +311,11 @@ int convertRecord(char * recordLine, char* record[]) {
  * whether it can be found or not
 */
 void savecmd(char *cmdline) {
+    /* ignore the !N command */
+    if (cmdline[0] == '!') {
+        return;
+    }
+
     /* path of history file */
     char hist_file[40];
     strcpy(hist_file, "home/");
@@ -358,7 +364,16 @@ void addentry(char * name, pid_t pid, int state) {
     }
 
     fprintf(fp, "Name: %s\n", name);
+    
     fprintf(fp, "Pid: %d\n", pid);
+    if (strcmp(name, "shell") == 0) {
+        fprintf(fp, "PPID: %d\n", getppid());
+    } else {
+        fprintf(fp, "PPID: %d\n", getpid());
+    }
+    
+    fprintf(fp, "PGID: %d\n", getpgid(pid));
+    fprintf(fp, "SID: %d\n", getpid());
     if (state == FG) {
         fprintf(fp, "STAT: R+\n");
     } else if (state == BG) {
@@ -383,6 +398,7 @@ void deleteentry(pid_t pid) {
         return;
     char entry[40];
     sprintf(entry, "proc/%d", pid);
+    kill(-pid, SIGINT);
     remove_directory(entry);
 }
 
@@ -456,12 +472,14 @@ void logout(struct job_t *jobs) {
  * If there are less than 10 commands, then show all of them.
 */
 void history() {
+    /* history file path */
     char hist_file[40];
     sprintf(hist_file, "home/%s/.tsh_history", username);
 
+    /* Try open history file */
     FILE *fp = fopen(hist_file, "r");
     if (fp == NULL) {
-        printf("Cannot open %s's history file", username);
+        printf("Cannot open %s's history file\n", username);
         exit(-1);
     }
 
@@ -475,6 +493,44 @@ void history() {
     
     fclose(fp);
 }
+
+/*   
+ * rerun_N - reruns the N command from the user’s history list.
+ * The format of command argument is "!N",  where N is a line number from the history command.
+*/
+int rerun_N(char *command) {
+    int n = atoi(&command[1]);
+    if (n < 1 || n > countlines()) {
+        printf("Line number is invalid\n");
+        return 0;
+    } else {
+        /* history file path */
+        char hist_file[40];
+        sprintf(hist_file, "home/%s/.tsh_history", username);
+
+        /* Try open history file */
+        FILE *fp = fopen(hist_file, "r");
+        if (fp == NULL) {
+            printf("Cannot open %s's history file\n", username);
+            exit(-1);
+        }
+
+        char *line = NULL;
+        long int len = 0;
+        int index = 0;
+        while (getline(&line, &len, fp) != -1) {
+            index++;
+            if (index == n) {   /* find the Nth command line */
+                eval(line);
+            }
+            
+        }
+        fclose(fp);
+        return 1;
+    }
+    
+}
+
 
 void update_shell_status(int state) {
     /* shell status file path*/
@@ -599,8 +655,7 @@ void eval(char *cmdline)
         return; /* Ignore empty lines */
     }
 
-    /* Save command line */
-    savecmd(cmdline);
+    
 
     if (!builtin_cmd(argv)) {
         sigprocmask(SIG_BLOCK, &mask_one, &prev_one);   /* Block SIGCHLD */
@@ -636,6 +691,8 @@ void eval(char *cmdline)
         }
     }   
 
+    /* Save command line */
+    savecmd(cmdline);
     return;
 }
 
@@ -717,6 +774,10 @@ int builtin_cmd(char **argv)
     } else if (strcmp(argv[0], "jobs") == 0) {  /* jobs command */
         listjobs(jobs);
         return 1;
+    } else if (argv[0][0] == '!') { /* !N command */
+        rerun_N(argv[0]);
+        return 1;
+        
     } else if (strcmp(argv[0], "bg") == 0) {    /* bg command */
         do_bgfg(argv);
         return 1;
@@ -1018,7 +1079,7 @@ void listjobs(struct job_t *jobs)
     int i;
     
     for (i = 0; i < MAXJOBS; i++) {
-	if (jobs[i].pid != 0) {
+	if (jobs[i].jid != 0) {
 	    printf("[%d] (%d) ", jobs[i].jid, jobs[i].pid);
 	    switch (jobs[i].state) {
 		case BG: 
@@ -1098,7 +1159,10 @@ handler_t *Signal(int signum, handler_t *handler)
  *    child shell by sending it a SIGQUIT signal.
  */
 void sigquit_handler(int sig) 
-{
+{   /* clear all jobs */
+    for (int i = 0; i < MAXJOBS; i++) {
+        deleteentry(jobs[i].pid);
+    }
     printf("Terminating after receipt of SIGQUIT signal\n");
     exit(1);
 }
